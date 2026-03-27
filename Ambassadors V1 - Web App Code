@@ -1,0 +1,1338 @@
+// ═══════════════════════════════════════════════════════════════════
+// APLAZO AMBASSADORS — Google Apps Script Web App
+// Deploy as: Execute as Me | Anyone can access
+// VERSION 2 — Premium redesign, full Aplazo brand, Uber-style landing
+// ═══════════════════════════════════════════════════════════════════
+
+function getConfig() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    anthropicKey: props.getProperty('ANTHROPIC_API_KEY') || '',
+    adminEmail:   props.getProperty('ADMIN_EMAIL') || 'team@aplazo.mx',
+    folderId:     props.getProperty('DRIVE_FOLDER_ID') || '',
+    sheetId:      props.getProperty('SHEET_ID') || '',
+  };
+}
+
+function doGet(e) {
+  return HtmlService
+    .createHtmlOutput(getAppHTML())
+    .setTitle('Aplazo — Programa Embajadores')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function doPost(e) {
+  const cors = ContentService.createTextOutput();
+  cors.setMimeType(ContentService.MimeType.JSON);
+  try {
+    const payload = JSON.parse(e.postData.contents);
+    if (payload.action === 'submit') {
+      const result = handleSubmission(payload);
+      cors.setContent(JSON.stringify({ ok: true, regId: result.regId }));
+      return cors;
+    }
+    cors.setContent(JSON.stringify({ ok: false, error: 'Unknown action' }));
+  } catch(err) {
+    cors.setContent(JSON.stringify({ ok: false, error: err.message }));
+  }
+  return cors;
+}
+
+function getBlankContractForBrowser() { return getContractPDFBase64(); }
+
+function submitRegistration(dataJson) {
+  const payload = JSON.parse(dataJson);
+  return handleSubmission(payload);
+}
+
+function b64ToBlob_(b64String, mimeType, filename) {
+  const clean = b64String.replace(/\s/g, '');
+  const bytes  = Utilities.base64Decode(clean);
+  return Utilities.newBlob(bytes, mimeType, filename);
+}
+
+// ── DIAGNOSTIC: run this manually from the Apps Script editor to verify Drive setup ──
+function testDriveSetup() {
+  const cfg = getConfig();
+  Logger.log('=== DRIVE SETUP DIAGNOSTIC ===');
+  Logger.log('DRIVE_FOLDER_ID value: [' + cfg.folderId + '] (length: ' + cfg.folderId.length + ')');
+  Logger.log('SHEET_ID value: [' + cfg.sheetId + '] (length: ' + cfg.sheetId.length + ')');
+  Logger.log('ADMIN_EMAIL value: [' + cfg.adminEmail + ']');
+
+  if (!cfg.folderId || !cfg.folderId.trim()) {
+    Logger.log('❌ DRIVE_FOLDER_ID is not set. Go to Project Settings → Script Properties and add it.');
+    return;
+  }
+  try {
+    const folder = DriveApp.getFolderById(cfg.folderId.trim());
+    Logger.log('✅ Folder found: ' + folder.getName() + ' | URL: ' + folder.getUrl());
+    // Try creating a test subfolder
+    const testSub = folder.createFolder('TEST_DELETE_ME_' + Date.now());
+    Logger.log('✅ Subfolder creation works: ' + testSub.getName());
+    // Try creating a test file
+    const testFile = testSub.createFile(Utilities.newBlob('test', 'text/plain', 'test.txt'));
+    Logger.log('✅ File creation works: ' + testFile.getUrl());
+    // Clean up
+    testFile.setTrashed(true);
+    testSub.setTrashed(true);
+    Logger.log('✅ Drive setup is fully working. You can safely delete the test files from Trash.');
+  } catch(err) {
+    Logger.log('❌ Drive error: ' + err.message);
+    Logger.log('Fix: Check the folder ID is correct and the script has Drive access (re-authorize if needed).');
+  }
+}
+
+function saveContractToStorage(argsJson) {
+  const args = JSON.parse(argsJson);
+  const { regId, contractB64, nom, ap, email } = args;
+  const cfg = getConfig();
+  if (!contractB64 || !regId) return { ok: false };
+  try {
+    const safeName = (nom + '_' + ap).replace(/[^a-zA-Z0-9_]/g, '_').substring(0, 40);
+    const blob = b64ToBlob_(contractB64, 'application/pdf', 'Contrato_' + safeName + '_' + regId + '.pdf');
+    let contractUrl = '', fileId = '';
+    const folderId = (cfg.folderId || '').trim();
+    if (folderId) {
+      try {
+        const folder = DriveApp.getFolderById(folderId);
+        let sub = null;
+        const iter = folder.getFolders();
+        while (iter.hasNext()) { const f = iter.next(); if (f.getName().indexOf(regId) === 0) { sub = f; break; } }
+        if (!sub) sub = folder.createFolder(regId + ' — ' + nom + ' ' + ap);
+        const cf = sub.createFile(blob);
+        contractUrl = cf.getUrl(); fileId = cf.getId();
+      } catch(driveErr) { Logger.log('saveContractToStorage Drive error: ' + driveErr.message); }
+    }
+    if (cfg.sheetId && contractUrl) {
+      try {
+        const sheet = SpreadsheetApp.openById(cfg.sheetId).getSheetByName('Registros');
+        if (sheet) {
+          const vals = sheet.getRange(1, 1, sheet.getLastRow(), 1).getValues();
+          for (let i = 1; i < vals.length; i++) { if (vals[i][0] === regId) { sheet.getRange(i+1, 19).setValue(contractUrl); break; } }
+        }
+      } catch(sheetErr) { Logger.log('saveContractToStorage Sheet error: ' + sheetErr.message); }
+    }
+    return { ok: true, contractUrl };
+  } catch(fatalErr) {
+    Logger.log('saveContractToStorage fatal: ' + fatalErr.message);
+    return { ok: false };
+  }
+}
+
+// ── Helper: get mime extension without shadowing catch variable ──
+function getMimeExt_(mime) {
+  return (mime || '').toLowerCase().indexOf('pdf') >= 0 ? 'pdf' : 'jpg';
+}
+
+function handleSubmission(payload) {
+  const cfg   = getConfig();
+  const regId = 'EMB-' + new Date().getTime().toString(36).toUpperCase();
+  const ts    = new Date().toLocaleString('es-MX', { timeZone:'America/Mexico_City' });
+
+  // Trim the folder ID — whitespace is the #1 silent killer
+  const folderId = (cfg.folderId || '').trim();
+  Logger.log('handleSubmission START — regId: ' + regId + ' | folderId set: ' + (folderId ? 'YES ('+folderId.length+' chars)' : 'NO'));
+
+  // ── Decode contract PDF ──────────────────────────────────────────
+  let contractPdfBlob = null, contractPdfBytes = null;
+  if (payload.contractB64 && payload.contractB64.length > 100) {
+    try {
+      const safeName = (payload.nom + '_' + payload.ap).replace(/[^a-zA-Z0-9_]/g, '_').substring(0, 40);
+      contractPdfBlob  = b64ToBlob_(payload.contractB64, 'application/pdf', 'Contrato_' + safeName + '_' + regId + '.pdf');
+      contractPdfBytes = contractPdfBlob.getBytes();
+      Logger.log('Contract decoded OK — ' + contractPdfBytes.length + ' bytes');
+    } catch(decodeErr) {
+      Logger.log('Contract decode FAILED: ' + decodeErr.message);
+      contractPdfBlob = null; contractPdfBytes = null;
+    }
+  } else {
+    Logger.log('No contractB64 in payload');
+  }
+
+  // ── Drive: create subfolder + upload each file independently ────
+  let driveLinks = {};
+
+  if (!folderId) {
+    Logger.log('⚠️ DRIVE_FOLDER_ID is empty — skipping all Drive uploads. Set it in Script Properties.');
+  } else {
+    // Step 1: Get parent folder
+    let parentFolder = null;
+    try {
+      parentFolder = DriveApp.getFolderById(folderId);
+      Logger.log('Parent folder OK: ' + parentFolder.getName());
+    } catch(folderErr) {
+      Logger.log('❌ Cannot open parent folder [' + folderId + ']: ' + folderErr.message);
+    }
+
+    // Step 2: Create ambassador subfolder
+    let sub = null;
+    if (parentFolder) {
+      try {
+        const subName = regId + ' — ' + (payload.nin || payload.nom || 'Embajador');
+        sub = parentFolder.createFolder(subName);
+        Logger.log('Subfolder created: ' + subName);
+      } catch(subErr) {
+        Logger.log('❌ Cannot create subfolder: ' + subErr.message);
+      }
+    }
+
+    // Step 3: Upload each file — each in its own try/catch, NO shared variable names
+    if (sub) {
+      // INE
+      if (payload.ineB64 && payload.ineB64.length > 10) {
+        try {
+          const ineExt  = getMimeExt_(payload.ineMime);
+          const ineMime = payload.ineMime || 'image/jpeg';
+          const ineBlob = b64ToBlob_(payload.ineB64, ineMime, 'INE.' + ineExt);
+          const ineFile = sub.createFile(ineBlob);
+          driveLinks.ine = ineFile.getUrl();
+          Logger.log('✅ INE uploaded: ' + driveLinks.ine);
+        } catch(ineErr) { Logger.log('❌ INE upload failed: ' + ineErr.message); }
+      } else { Logger.log('INE b64 missing or empty'); }
+
+      // Bank statement
+      if (payload.bankB64 && payload.bankB64.length > 10) {
+        try {
+          const bankExt  = getMimeExt_(payload.bankMime);
+          const bankMime = payload.bankMime || 'image/jpeg';
+          const bankBlob = b64ToBlob_(payload.bankB64, bankMime, 'EstadoCuenta.' + bankExt);
+          const bankFile = sub.createFile(bankBlob);
+          driveLinks.bank = bankFile.getUrl();
+          Logger.log('✅ Bank statement uploaded: ' + driveLinks.bank);
+        } catch(bankErr) { Logger.log('❌ Bank upload failed: ' + bankErr.message); }
+      } else { Logger.log('Bank b64 missing or empty'); }
+
+      // Proof of address
+      if (payload.domB64 && payload.domB64.length > 10) {
+        try {
+          const domExt  = getMimeExt_(payload.domMime);
+          const domMime = payload.domMime || 'image/jpeg';
+          const domBlob = b64ToBlob_(payload.domB64, domMime, 'ComprobanteDomicilio.' + domExt);
+          const domFile = sub.createFile(domBlob);
+          driveLinks.domDoc = domFile.getUrl();
+          Logger.log('✅ Domicilio uploaded: ' + driveLinks.domDoc);
+        } catch(domErr) { Logger.log('❌ Domicilio upload failed: ' + domErr.message); }
+      } else { Logger.log('Domicilio b64 missing or empty'); }
+
+      // Signed contract PDF
+      if (contractPdfBytes && contractPdfBytes.length > 0) {
+        try {
+          const contractBlob = Utilities.newBlob(contractPdfBytes, 'application/pdf', contractPdfBlob.getName());
+          const contractFile = sub.createFile(contractBlob);
+          driveLinks.contract       = contractFile.getUrl();
+          driveLinks.contractFileId = contractFile.getId();
+          Logger.log('✅ Contract PDF uploaded: ' + driveLinks.contract);
+        } catch(contractErr) { Logger.log('❌ Contract PDF upload failed: ' + contractErr.message); }
+      } else { Logger.log('No contract bytes to upload'); }
+
+    } else {
+      Logger.log('⚠️ Subfolder is null — all Drive uploads skipped');
+    }
+  }
+
+  if (cfg.sheetId) {
+    try {
+      const ss = SpreadsheetApp.openById(cfg.sheetId);
+      const sheet = ss.getSheetByName('Registros') || ss.insertSheet('Registros');
+      const H = ['RegID','Timestamp','Nombre INE','Nombre','Apellido','RFC','Email','Tel','Ciudad','Banco','Cuenta','CLABE','Titular','Domicilio','Fuente','Drive INE','Drive Banco','Drive Comp Dom','Drive Contrato'];
+      if (sheet.getLastRow() === 0) sheet.appendRow(H);
+      else if (sheet.getRange(1,1).getValue() !== 'RegID') { sheet.insertRowBefore(1); sheet.getRange(1,1,1,H.length).setValues([H]); }
+      sheet.appendRow([regId,ts,payload.nin,payload.nom,payload.ap,payload.rfc,payload.email,payload.tel,payload.ciudad,payload.banco,payload.cuenta,payload.clabe,payload.titular,payload.domicilio||payload.dom||'',payload.fuente||'',driveLinks.ine||'',driveLinks.bank||'',driveLinks.domDoc||'',driveLinks.contract||'']);
+    } catch(err) { Logger.log('Sheet error: ' + err.message); }
+  }
+
+  try {
+    let cBlob = null;
+    if (driveLinks.contractFileId) { try { cBlob = DriveApp.getFileById(driveLinks.contractFileId).getBlob(); } catch(e){} }
+    if (!cBlob && contractPdfBytes) { try { cBlob = Utilities.newBlob(contractPdfBytes,'application/pdf','Contrato_'+regId+'.pdf'); } catch(e){} }
+    MailApp.sendEmail({ to:cfg.adminEmail, subject:'[Embajador] Nuevo registro: '+payload.nom+' '+payload.ap+' — '+regId, htmlBody:buildAdminEmail(regId,ts,payload,driveLinks), attachments:cBlob?[cBlob]:[] });
+  } catch(err) { Logger.log('Admin email: ' + err.message); }
+
+  if (payload.email) {
+    try {
+      let cBlob = null;
+      if (driveLinks.contractFileId) { try { cBlob = DriveApp.getFileById(driveLinks.contractFileId).getBlob(); } catch(e){} }
+      if (!cBlob && contractPdfBytes) { try { cBlob = Utilities.newBlob(contractPdfBytes,'application/pdf','Contrato_Aplazo_'+regId+'.pdf'); } catch(e){} }
+      MailApp.sendEmail({ to:payload.email, subject:'¡Bienvenido al Programa Embajadores Aplazo! — '+regId, htmlBody:buildAmbassadorEmail(regId,payload), attachments:cBlob?[cBlob]:[] });
+    } catch(err) { Logger.log('Amb email: ' + err.message); }
+  }
+
+  return { regId };
+}
+
+function buildAdminEmail(regId, ts, p, links) {
+  const row = (l,v)=>`<tr><td style="padding:6px 12px;color:#5A6E7A;font-size:13px;white-space:nowrap">${l}</td><td style="padding:6px 12px;font-weight:600;font-size:13px">${v||'—'}</td></tr>`;
+  const driveRow = (l,u)=>u?`<tr><td style="padding:6px 12px;color:#5A6E7A;font-size:13px">${l}</td><td style="padding:6px 12px"><a href="${u}" style="color:#18A8C0">Ver en Drive →</a></td></tr>`:'';
+  return `<!DOCTYPE html><html><body style="font-family:'Helvetica Neue',sans-serif;background:#F2F4F6;margin:0;padding:20px"><div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08)"><div style="background:#214345;padding:24px 28px"><div style="background:#4AC9E3;border-radius:6px;padding:4px 10px;font-weight:800;font-size:16px;color:#214345;display:inline-block">aplazo</div><span style="color:rgba(255,255,255,.8);font-size:13px;margin-left:10px">Nuevo Registro — Programa Embajadores</span></div><div style="padding:24px 28px"><div style="background:#D6F5FA;border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:13px;color:#0C617A"><strong>ID:</strong> ${regId} &nbsp;·&nbsp; <strong>Fecha:</strong> ${ts}</div><table style="width:100%;border-collapse:collapse;background:#F2F4F6;border-radius:8px;overflow:hidden">${row('Nombre INE',p.nin)}${row('Nombre',p.nom+' '+p.ap)}${row('RFC',p.rfc)}${row('Email',p.email)}${row('Teléfono',p.tel)}${row('Ciudad',p.ciudad)}${row('Banco',p.banco)}${row('Cuenta',p.cuenta)}${row('CLABE',p.clabe)}${row('Titular',p.titular)}${row('Domicilio',p.domicilio||p.dom)}${row('Fuente',p.fuente)}</table>${(links.ine||links.bank||links.domDoc||links.contract)?`<div style="margin-top:16px"><div style="font-size:12px;font-weight:700;color:#5A6E7A;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Documentos en Drive</div><table style="width:100%;border-collapse:collapse;background:#F2F4F6;border-radius:8px;overflow:hidden">${driveRow('INE / IFE',links.ine)}${driveRow('Estado de cuenta',links.bank)}${driveRow('Comp. domicilio',links.domDoc)}${driveRow('Contrato firmado',links.contract)}</table></div>`:''}</div><div style="background:#EBEDF0;padding:16px 28px;font-size:11px;color:#8FA0AC;text-align:center">Generado automáticamente · Sistema de registro Embajadores Aplazo</div></div></body></html>`;
+}
+
+function buildAmbassadorEmail(regId, p) {
+  return `<!DOCTYPE html><html><body style="font-family:'Helvetica Neue',sans-serif;background:#F2F4F6;margin:0;padding:20px"><div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08)"><div style="background:#214345;padding:32px 28px;text-align:center"><div style="background:#4AC9E3;border-radius:8px;padding:6px 14px;font-weight:800;font-size:20px;color:#214345;display:inline-block;margin-bottom:12px">aplazo</div><div style="color:#fff;font-size:22px;font-weight:700">¡Bienvenido al Programa!</div><div style="color:rgba(255,255,255,.7);font-size:14px;margin-top:6px">Programa Embajadores Aplazo</div></div><div style="padding:28px"><p style="font-size:15px;color:#2E343A;margin:0 0 16px">Hola <strong>${p.nom}</strong>,</p><p style="font-size:14px;color:#5A6E7A;line-height:1.6;margin:0 0 20px">Tu registro como embajador de Aplazo ha sido recibido exitosamente. Adjunto encontrarás tu contrato firmado como comprobante.</p><div style="background:#D6F5FA;border-radius:10px;padding:16px 20px;margin-bottom:20px"><div style="font-size:11px;font-weight:700;color:#0C617A;text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px">Tu registro</div><div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(74,201,227,.2);font-size:13px"><span style="color:#0C617A">ID</span><strong style="font-family:monospace">${regId}</strong></div><div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(74,201,227,.2);font-size:13px"><span style="color:#0C617A">Comisión</span><strong>$250 MXN por usuario activado</strong></div><div style="display:flex;justify-content:space-between;padding:5px 0;font-size:13px"><span style="color:#0C617A">Vigencia</span><strong>2 meses desde la firma</strong></div></div><div style="background:#EAF7D5;border:1px solid #a3d97a;border-radius:8px;padding:12px 16px;font-size:13px;color:#357A09;margin-bottom:20px"><strong>Próximos pasos:</strong> En las próximas 24 hrs recibirás tu QR personalizado por WhatsApp al número ${p.tel}.</div><p style="font-size:13px;color:#8FA0AC">Dudas: <a href="mailto:embajadores@aplazo.mx" style="color:#18A8C0">embajadores@aplazo.mx</a></p></div><div style="background:#EBEDF0;padding:16px 28px;font-size:11px;color:#8FA0AC;text-align:center">APLAZ S.A. de C.V. · Av. Paseo de las Palmas 830, Int. 402, CDMX · legal@aplazo.mx</div></div></body></html>`;
+}
+
+function getBlankContractB64() { return getContractPDFBase64(); }
+
+// ── SERVE HTML APP ────────────────────────────────────────────────
+function getAppHTML() {
+  var contractB64Embedded = getContractPDFBase64();
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aplazo — Programa Embajadores</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --cy:#4AC9E3;--tl:#214345;--fm:#D6F5FA;--se:#0C617A;--aq:#18A8C0;
+  --bg:#F2F4F6;--card:#fff;--t1:#060606;--t2:#2E343A;--t3:#7F8D98;
+  --bd:#E2E5E8;--n100:#EBEDF0;--n200:#D8DCE0;--n400:#8FA0AC;--n500:#5A6E7A;
+  --gn:#5AAD12;--gl:#EAF7D5;--gd:#357A09;
+  --yl:#FFF3CC;--yc:#B07800;--red:#D41413;
+  --mid:#0A2B2D;
+  --sh-sm:0 1px 4px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
+  --sh-md:0 4px 16px rgba(0,0,0,.10),0 2px 6px rgba(0,0,0,.06);
+  --sh-lg:0 12px 40px rgba(0,0,0,.13),0 4px 12px rgba(0,0,0,.07);
+  --sh-xl:0 24px 64px rgba(0,0,0,.16),0 8px 24px rgba(0,0,0,.08);
+}
+html{scroll-behavior:smooth}
+body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);color:var(--t1);min-height:100vh;overflow-x:hidden}
+
+/* ── ANIMATIONS ── */
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.04)}}
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+@keyframes floatBlob{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-18px) scale(1.03)}}
+.au{animation:fadeUp .5s ease both}
+.au1{animation-delay:.05s}.au2{animation-delay:.12s}.au3{animation-delay:.2s}.au4{animation-delay:.28s}.au5{animation-delay:.36s}
+
+/* ── TYPOGRAPHY ── */
+.display{font-size:clamp(34px,5vw,56px);font-weight:800;line-height:1.08;letter-spacing:-1.5px}
+.h1{font-size:clamp(22px,3vw,32px);font-weight:800;letter-spacing:-.5px}
+.h2{font-size:20px;font-weight:800}
+.h3{font-size:17px;font-weight:700}
+.overline{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:2px}
+
+/* ── NAVBAR ── */
+.nav{height:60px;background:var(--tl);display:flex;align-items:center;justify-content:space-between;
+  padding:0 24px;position:sticky;top:0;z-index:500;box-shadow:0 2px 20px rgba(0,0,0,.2)}
+.nav-logo{display:flex;align-items:center;gap:8px}
+.logo-pill{background:var(--cy);border-radius:10px;padding:5px 12px 5px 10px;display:flex;align-items:center;gap:6px}
+.logo-text{font-size:18px;font-weight:800;color:var(--tl);letter-spacing:-.5px}
+.logo-icon{width:20px;height:20px;position:relative}
+.logo-icon::before{content:'';position:absolute;inset:0;border:2.5px solid var(--tl);border-radius:50%}
+.logo-icon::after{content:'';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  width:7px;height:7px;background:var(--tl);border-radius:50%}
+.nav-badge{background:rgba(74,201,227,.18);border:1.5px solid rgba(74,201,227,.35);color:var(--cy);
+  font-size:11px;font-weight:700;padding:4px 12px;border-radius:100px;letter-spacing:.5px}
+.nav-cta{background:var(--cy);color:var(--tl);border:none;border-radius:100px;
+  font-family:'Plus Jakarta Sans',sans-serif;font-weight:700;font-size:13px;
+  padding:8px 20px;cursor:pointer;transition:transform .1s,box-shadow .15s;display:none}
+.nav-cta:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(74,201,227,.4)}
+
+/* ── HERO ── */
+.hero{background:var(--tl);min-height:calc(100vh - 60px);display:flex;flex-direction:column;
+  justify-content:center;padding:60px 24px 80px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:-80px;right:-120px;width:600px;height:600px;
+  border-radius:50%;background:radial-gradient(circle,rgba(74,201,227,.12) 0%,transparent 70%);
+  animation:floatBlob 8s ease-in-out infinite}
+.hero::after{content:'';position:absolute;bottom:-100px;left:-80px;width:400px;height:400px;
+  border-radius:50%;background:radial-gradient(circle,rgba(74,201,227,.07) 0%,transparent 70%)}
+.hero-inner{max-width:1100px;margin:0 auto;width:100%;display:grid;grid-template-columns:1fr 1fr;
+  gap:60px;align-items:center;position:relative;z-index:1}
+.hero-badge{display:inline-flex;align-items:center;gap:8px;background:rgba(74,201,227,.12);
+  border:1px solid rgba(74,201,227,.3);border-radius:100px;padding:6px 14px;margin-bottom:20px}
+.hero-badge-dot{width:7px;height:7px;background:var(--cy);border-radius:50%;animation:pulse 2s infinite}
+.hero-badge span{color:var(--cy);font-size:12px;font-weight:700;letter-spacing:.5px}
+.hero-title{color:#fff;margin-bottom:16px}
+.hero-title .accent{color:var(--cy)}
+.hero-sub{color:rgba(255,255,255,.65);font-size:17px;line-height:1.65;margin-bottom:32px;font-weight:400}
+.hero-ctas{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.btn-hero{background:var(--cy);color:var(--tl);border:none;border-radius:100px;
+  font-family:'Plus Jakarta Sans',sans-serif;font-weight:800;font-size:16px;
+  padding:16px 32px;cursor:pointer;transition:all .2s;display:inline-flex;align-items:center;gap:8px;
+  box-shadow:0 6px 24px rgba(74,201,227,.35)}
+.btn-hero:hover{transform:translateY(-2px);box-shadow:0 10px 32px rgba(74,201,227,.45)}
+.btn-hero:active{transform:scale(.97)}
+.btn-hero-outline{background:transparent;color:rgba(255,255,255,.8);border:1.5px solid rgba(255,255,255,.25);
+  border-radius:100px;font-family:'Plus Jakarta Sans',sans-serif;font-weight:600;font-size:14px;
+  padding:14px 24px;cursor:pointer;transition:all .2s}
+.btn-hero-outline:hover{border-color:rgba(255,255,255,.5);color:#fff}
+.hero-trust{display:flex;align-items:center;gap:16px;margin-top:28px;flex-wrap:wrap}
+.hero-trust-item{display:flex;align-items:center;gap:7px;color:rgba(255,255,255,.6);font-size:12px;font-weight:600}
+.hero-trust-item i{color:var(--cy);font-size:14px}
+
+/* Hero right card */
+.hero-card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
+  border-radius:24px;padding:28px;backdrop-filter:blur(20px)}
+.hero-earn-badge{background:var(--cy);border-radius:16px;padding:18px 22px;margin-bottom:20px;display:flex;align-items:center;gap:16px}
+.earn-amount{font-size:38px;font-weight:800;color:var(--tl);line-height:1}
+.earn-label{font-size:13px;color:var(--tl);font-weight:600;opacity:.8;line-height:1.3}
+.hero-steps{display:flex;flex-direction:column;gap:14px}
+.hero-step{display:flex;align-items:flex-start;gap:14px}
+.step-num{width:32px;height:32px;background:rgba(74,201,227,.15);border:1px solid rgba(74,201,227,.3);
+  border-radius:10px;display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:800;color:var(--cy);flex-shrink:0}
+.step-txt h4{font-size:13px;font-weight:700;color:#fff;margin-bottom:2px}
+.step-txt p{font-size:12px;color:rgba(255,255,255,.5);line-height:1.4}
+
+/* ── SECTION DIVIDER WAVE ── */
+.wave{width:100%;overflow:hidden;line-height:0;background:var(--tl)}
+.wave svg{display:block}
+
+/* ── WHY SECTION ── */
+.section{padding:72px 24px}
+.section-inner{max-width:1100px;margin:0 auto}
+.section-header{text-align:center;margin-bottom:52px}
+.section-eyebrow{display:inline-block;background:var(--fm);color:var(--se);
+  font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+  padding:5px 14px;border-radius:100px;margin-bottom:12px}
+.section-title{font-size:clamp(26px,3.5vw,38px);font-weight:800;color:var(--tl);
+  letter-spacing:-.5px;line-height:1.15;margin-bottom:12px}
+.section-sub{font-size:16px;color:var(--t3);max-width:520px;margin:0 auto;line-height:1.65}
+.features-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.feature-card{background:var(--card);border:1px solid var(--bd);border-radius:20px;
+  padding:28px 24px;transition:all .25s;cursor:default}
+.feature-card:hover{border-color:var(--cy);box-shadow:var(--sh-lg);transform:translateY(-4px)}
+.feature-icon{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+  font-size:22px;margin-bottom:18px}
+.feature-card h3{font-size:17px;font-weight:800;color:var(--tl);margin-bottom:8px}
+.feature-card p{font-size:14px;color:var(--t3);line-height:1.6}
+
+/* ── HOW IT WORKS ── */
+.how-section{background:var(--tl);padding:72px 24px;position:relative;overflow:hidden}
+.how-section::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;
+  background:radial-gradient(ellipse at 80% 50%,rgba(74,201,227,.08) 0%,transparent 60%)}
+.how-inner{max-width:1100px;margin:0 auto;position:relative;z-index:1}
+.how-steps{display:grid;grid-template-columns:repeat(4,1fr);gap:0;margin-top:48px;position:relative}
+.how-steps::before{content:'';position:absolute;top:28px;left:12%;right:12%;height:2px;
+  background:linear-gradient(90deg,rgba(74,201,227,.3),rgba(74,201,227,.3));z-index:0}
+.how-step{text-align:center;padding:0 16px;position:relative;z-index:1}
+.how-step-num{width:56px;height:56px;background:var(--cy);border-radius:50%;
+  display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;
+  color:var(--tl);margin:0 auto 18px;box-shadow:0 0 0 8px rgba(74,201,227,.15)}
+.how-step h3{font-size:15px;font-weight:700;color:#fff;margin-bottom:8px}
+.how-step p{font-size:13px;color:rgba(255,255,255,.55);line-height:1.55}
+
+/* ── EARNINGS SECTION ── */
+.earn-section{padding:72px 24px;background:linear-gradient(135deg,#f8fffe 0%,var(--fm) 100%)}
+.earn-inner{max-width:900px;margin:0 auto}
+.earn-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:48px}
+.earn-card{background:var(--card);border-radius:20px;padding:28px;border:1px solid var(--bd);box-shadow:var(--sh-sm)}
+.earn-card.featured{background:var(--tl);border-color:transparent;box-shadow:var(--sh-lg)}
+.earn-card.featured h2{color:var(--cy)}
+.earn-card.featured p{color:rgba(255,255,255,.65)}
+.earn-card.featured .earn-detail{border-color:rgba(255,255,255,.1);color:rgba(255,255,255,.8)}
+.earn-big{font-size:52px;font-weight:800;color:var(--tl);letter-spacing:-2px;line-height:1}
+.earn-unit{font-size:18px;font-weight:600;vertical-align:super}
+.earn-freq{font-size:14px;color:var(--t3);margin-top:6px}
+.earn-detail{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--bd);
+  margin-top:16px;font-size:13px;color:var(--t2)}
+.earn-detail i{color:var(--cy);font-size:16px;flex-shrink:0}
+
+/* ── STEPPER ── */
+.stepper-wrap{background:var(--card);border-bottom:1px solid var(--bd);padding:0 24px;position:sticky;top:60px;z-index:400}
+.stepper-inner{display:flex;align-items:center;max-width:720px;margin:0 auto;padding:16px 0}
+.s-dot{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:11px;font-weight:800;flex-shrink:0;transition:all .3s}
+.s-label{font-size:11px;font-weight:700;white-space:nowrap;margin-left:8px;letter-spacing:.3px}
+.s-line{flex:1;height:2px;border-radius:2px;margin:0 8px;min-width:16px;transition:background .3s}
+
+/* ── FORM WRAPPER ── */
+.form-wrap{max-width:720px;margin:0 auto;padding:28px 24px 100px}
+.fcard{background:var(--card);border-radius:20px;border:1px solid var(--bd);
+  box-shadow:var(--sh-sm);padding:28px;margin-bottom:16px;transition:box-shadow .2s}
+.fcard:focus-within{box-shadow:var(--sh-md);border-color:rgba(74,201,227,.3)}
+.fcard-header{margin-bottom:22px}
+.fcard-eyebrow{display:inline-flex;align-items:center;gap:6px;background:var(--fm);color:var(--se);
+  font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+  padding:4px 10px;border-radius:100px;margin-bottom:10px}
+.fcard-title{font-size:20px;font-weight:800;color:var(--tl);margin-bottom:4px}
+.fcard-sub{font-size:13px;color:var(--t3);line-height:1.5}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.span2{grid-column:1/-1}
+.fld{display:flex;flex-direction:column;gap:5px}
+.fld label{font-size:11px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:.8px}
+.fld .hint{font-size:11px;color:var(--t3);line-height:1.4}
+.fld .err-msg{font-size:11px;color:var(--red);display:none}
+input,select{height:46px;border:1.5px solid var(--bd);border-radius:12px;background:var(--card);
+  padding:0 14px;font-family:'Plus Jakarta Sans',sans-serif;font-size:14px;
+  color:var(--t1);width:100%;transition:border-color .15s,box-shadow .15s;-webkit-appearance:none}
+input:focus,select:focus{outline:none;border-color:var(--cy);box-shadow:0 0 0 3px rgba(74,201,227,.15)}
+input.ok{border-color:var(--gn);background:#f8fff4}
+input.err{border-color:var(--red)}
+input.err + .err-msg{display:block}
+
+/* ── UPLOAD ZONES ── */
+.upzone{border:2px dashed var(--bd);border-radius:16px;padding:22px 12px;text-align:center;
+  cursor:pointer;background:var(--bg);transition:all .22s;position:relative}
+.upzone:hover{border-color:var(--cy);background:#f0fbfd}
+.upzone.done{border-style:solid;border-color:var(--gn);background:#f0fdf4}
+.upzone.loading{border-color:var(--cy);background:var(--fm);pointer-events:none}
+.upzone-icon{width:46px;height:46px;border-radius:13px;display:flex;align-items:center;
+  justify-content:center;margin:0 auto 10px;font-size:22px;transition:all .2s}
+.upzone-label{font-size:12px;font-weight:700;margin-bottom:2px}
+.upzone-sub{font-size:10px;color:var(--t3)}
+.doc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+
+/* ── BUTTONS ── */
+.btn{border-radius:100px;font-family:'Plus Jakarta Sans',sans-serif;font-weight:700;
+  cursor:pointer;border:none;display:inline-flex;align-items:center;gap:8px;
+  transition:transform .1s,opacity .15s,box-shadow .15s;font-size:14px;letter-spacing:.2px}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-primary{background:var(--cy);color:var(--tl);padding:14px 30px;
+  box-shadow:0 4px 16px rgba(74,201,227,.35);font-size:15px;font-weight:800}
+.btn-primary:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 8px 24px rgba(74,201,227,.4)}
+.btn-outline{background:transparent;border:1.5px solid var(--bd);color:var(--t2);
+  padding:12px 24px;font-size:13px}
+.btn-outline:hover{border-color:var(--n400);background:var(--bg)}
+.btn-full{width:100%;justify-content:center}
+.form-nav{display:flex;justify-content:space-between;align-items:center;margin-top:24px;gap:12px}
+
+/* ── SPIN ── */
+.spin{border-radius:50%;animation:spin .65s linear infinite;flex-shrink:0}
+
+/* ── REVIEW GRID ── */
+.review-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.review-cell{background:var(--bg);border-radius:12px;padding:12px 14px;border:1px solid var(--bd)}
+.review-key{font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;
+  letter-spacing:.8px;margin-bottom:4px}
+.review-val{font-size:13px;font-weight:700;color:var(--tl);word-break:break-all;line-height:1.3}
+.doc-status-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}
+.doc-status-chip{background:var(--gl);border:1px solid #a3d97a;border-radius:100px;
+  padding:6px 12px;font-size:11px;font-weight:700;color:var(--gd);
+  display:flex;align-items:center;gap:5px;justify-content:center}
+
+/* ── CONTRACT ── */
+.contract-scroll{background:var(--bg);border:1px solid var(--bd);border-radius:14px;
+  max-height:280px;overflow-y:auto;padding:18px 20px;font-size:12px;line-height:1.85;color:var(--t2)}
+.contract-scroll::-webkit-scrollbar{width:4px}
+.contract-scroll::-webkit-scrollbar-thumb{background:var(--n200);border-radius:2px}
+.contract-filled-row{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;
+  background:var(--fm);border-radius:10px;padding:12px 14px;margin-bottom:12px;
+  border:1px solid rgba(74,201,227,.25)}
+.hl{background:rgba(74,201,227,.25);border-radius:4px;padding:0 4px;font-weight:700;color:var(--tl)}
+.accept-row{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;
+  background:var(--n100);border-radius:14px;margin-top:14px;cursor:pointer;
+  transition:background .15s;border:1.5px solid transparent}
+.accept-row:hover{background:#e4f9fd;border-color:rgba(74,201,227,.3)}
+.accept-row.checked{background:#e4f9fd;border-color:rgba(74,201,227,.4)}
+.sig-block{background:var(--tl);border-radius:16px;padding:20px 24px;text-align:center;margin-top:14px}
+.sig-name{font-size:28px;font-weight:800;color:var(--cy);font-style:italic;letter-spacing:-.5px}
+.sig-meta{font-size:11px;color:rgba(255,255,255,.5);margin-top:6px}
+
+/* ── SUCCESS ── */
+.success-hero{background:var(--tl);border-radius:24px;padding:44px 28px;text-align:center;
+  margin-bottom:20px;position:relative;overflow:hidden}
+.success-hero::before{content:'';position:absolute;top:-40px;right:-40px;width:200px;height:200px;
+  border-radius:50%;background:radial-gradient(rgba(74,201,227,.15),transparent 70%)}
+.success-check{width:76px;height:76px;background:var(--cy);border-radius:50%;
+  display:flex;align-items:center;justify-content:center;margin:0 auto 20px;
+  font-size:32px;color:var(--tl);box-shadow:0 0 0 12px rgba(74,201,227,.2)}
+.success-id{font-family:monospace;background:rgba(74,201,227,.15);border:1px solid rgba(74,201,227,.3);
+  border-radius:10px;padding:8px 18px;font-size:16px;font-weight:700;color:var(--cy);
+  display:inline-block;margin-top:14px;letter-spacing:2px}
+.summ-list{display:flex;flex-direction:column;gap:2px}
+.summ-row{display:flex;justify-content:space-between;padding:10px 0;
+  border-bottom:1px solid rgba(74,201,227,.12);font-size:13px}
+.summ-row:last-child{border-bottom:none}
+.dl-card{background:linear-gradient(135deg,var(--gl) 0%,#d4f7b8 100%);
+  border:1px solid #a3d97a;border-radius:16px;padding:20px 22px}
+
+/* ── OVERLAY ── */
+.overlay{position:fixed;inset:0;background:rgba(21,35,38,.88);z-index:999;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;
+  backdrop-filter:blur(8px)}
+.overlay-card{background:var(--card);border-radius:20px;padding:36px 40px;
+  text-align:center;box-shadow:var(--sh-xl);min-width:260px}
+
+/* ── FOOTER ── */
+.footer{background:var(--tl);padding:32px 24px;text-align:center}
+.footer-logo{display:inline-flex;align-items:center;gap:8px;margin-bottom:12px}
+.footer p{font-size:12px;color:rgba(255,255,255,.4);line-height:1.8}
+.footer a{color:rgba(255,255,255,.55);text-decoration:none}
+.footer a:hover{color:var(--cy)}
+
+/* ── RESPONSIVE ── */
+@media(max-width:768px){
+  .hero-inner{grid-template-columns:1fr;gap:36px}
+  .hero-card{display:none}
+  .features-grid{grid-template-columns:1fr}
+  .how-steps{grid-template-columns:1fr 1fr;gap:28px}
+  .how-steps::before{display:none}
+  .earn-grid{grid-template-columns:1fr}
+  .g2{grid-template-columns:1fr}
+  .doc-grid{grid-template-columns:1fr}
+  .review-grid{grid-template-columns:1fr}
+  .doc-status-row{grid-template-columns:1fr}
+  .s-label{display:none}
+  .nav-cta{display:none}
+}
+@media(min-width:769px){ .nav-cta{display:inline-flex} }
+</style>
+</head>
+<body>
+
+<!-- NAVBAR -->
+<nav class="nav">
+  <div class="nav-logo">
+    <div class="logo-pill">
+      <span class="logo-text">aplazo</span>
+      <div class="logo-icon"></div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="nav-badge">✦ Embajadores</div>
+    <button class="nav-cta" onclick="document.getElementById('registro').scrollIntoView({behavior:'smooth'})">
+      Registrarme <i class="bi bi-arrow-right"></i>
+    </button>
+  </div>
+</nav>
+
+<!-- OVERLAY -->
+<div class="overlay" id="overlay" style="display:none">
+  <div class="overlay-card">
+    <div class="spin" style="width:44px;height:44px;border:3px solid #EBEDF0;border-top-color:#4AC9E3;margin:0 auto 16px"></div>
+    <div style="font-size:16px;font-weight:800;color:var(--tl)" id="overlay-msg">Procesando...</div>
+    <div style="font-size:13px;color:var(--t3);margin-top:6px" id="overlay-sub"></div>
+  </div>
+</div>
+
+<!-- HERO SECTION -->
+<section class="hero" id="inicio">
+  <div class="hero-inner">
+    <div>
+      <div class="hero-badge au au1">
+        <div class="hero-badge-dot"></div>
+        <span>Programa activo · Únete hoy</span>
+      </div>
+      <h1 class="display hero-title au au2">
+        Gana dinero<br>refiriendo <span class="accent">Aplazo</span>
+      </h1>
+      <p class="hero-sub au au3">
+        Conviértete en embajador Aplazo y gana <strong style="color:#fff">$250 MXN</strong> por cada persona que actives. Sin límite de ganancias. Sin horarios fijos.
+      </p>
+      <div class="hero-ctas au au4">
+        <button class="btn-hero" onclick="document.getElementById('registro').scrollIntoView({behavior:'smooth'})">
+          <i class="bi bi-rocket-takeoff-fill"></i>
+          Quiero ser embajador
+        </button>
+        <button class="btn-hero-outline" onclick="document.getElementById('como-funciona').scrollIntoView({behavior:'smooth'})">
+          Cómo funciona <i class="bi bi-chevron-down"></i>
+        </button>
+      </div>
+      <div class="hero-trust au au5">
+        <div class="hero-trust-item"><i class="bi bi-shield-check-fill"></i> Pago directo a tu cuenta</div>
+        <div class="hero-trust-item"><i class="bi bi-clock-fill"></i> Registro en 5 minutos</div>
+        <div class="hero-trust-item"><i class="bi bi-people-fill"></i> Sin límite de referidos</div>
+      </div>
+    </div>
+    <div class="hero-card au au3">
+      <div class="hero-earn-badge">
+        <div>
+          <div class="earn-amount">$250</div>
+          <div style="font-size:11px;font-weight:600;color:var(--tl);opacity:.7;margin-top:2px">PESOS MEXICANOS</div>
+        </div>
+        <div class="earn-label">por cada usuario<br>que actives con Aplazo</div>
+      </div>
+      <div class="hero-steps">
+        <div class="hero-step">
+          <div class="step-num">1</div>
+          <div class="step-txt"><h4>Regístrate gratis</h4><p>Llena el formulario y firma tu contrato digital en minutos.</p></div>
+        </div>
+        <div class="hero-step">
+          <div class="step-num">2</div>
+          <div class="step-txt"><h4>Comparte tu QR</h4><p>Recibe tu código QR único y compártelo donde quieras.</p></div>
+        </div>
+        <div class="hero-step">
+          <div class="step-num">3</div>
+          <div class="step-txt"><h4>Cobras tu comisión</h4><p>Cada usuario activado = $250 depositados a tu CLABE.</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- WAVE -->
+<div class="wave">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 56" fill="#F2F4F6">
+    <path d="M0,32L60,28C120,24,240,16,360,18.7C480,21,600,35,720,37.3C840,40,960,32,1080,26.7C1200,21,1320,19,1380,18.7L1440,18L1440,56L1380,56C1320,56,1200,56,1080,56C960,56,840,56,720,56C600,56,480,56,360,56C240,56,120,56,60,56L0,56Z"/>
+  </svg>
+</div>
+
+<!-- WHY SECTION -->
+<section class="section" id="beneficios">
+  <div class="section-inner">
+    <div class="section-header">
+      <div class="section-eyebrow">Por qué ser embajador</div>
+      <h2 class="section-title">Todo a tu favor</h2>
+      <p class="section-sub">Flexibilidad total, ingresos reales y el respaldo de una marca que millones de mexicanos ya confían.</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon" style="background:#D6F5FA;color:var(--se)"><i class="bi bi-cash-coin"></i></div>
+        <h3>Ingresos sin límite</h3>
+        <p>Gana $250 MXN por cada usuario activado. Sin tope mensual. Cuantos más refiertes, más ganas.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon" style="background:#EAF7D5;color:var(--gd)"><i class="bi bi-clock-history"></i></div>
+        <h3>Tu tiempo, tus reglas</h3>
+        <p>No hay horarios ni territorios fijos. Trabaja desde donde quieras, cuando quieras.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon" style="background:#FFF3CC;color:#7A5200"><i class="bi bi-qr-code-scan"></i></div>
+        <h3>QR personalizado</h3>
+        <p>Recibe tu código QR único para rastrear cada referido y comprobar tus ganancias en tiempo real.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon" style="background:rgba(74,201,227,.15);color:var(--aq)"><i class="bi bi-bank2"></i></div>
+        <h3>Pago directo a tu cuenta</h3>
+        <p>Las comisiones se depositan directamente a tu CLABE interbancaria. Sin apps ni monederos intermediarios.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon" style="background:#F5E8FA;color:#5C2272"><i class="bi bi-shield-lock-fill"></i></div>
+        <h3>Respaldo legal</h3>
+        <p>Contrato de comisión mercantil formal. Tu dinero y tu actividad protegidos con un acuerdo claro.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon" style="background:rgba(33,67,69,.08);color:var(--tl)"><i class="bi bi-graph-up-arrow"></i></div>
+        <h3>Marca de confianza</h3>
+        <p>Aplazo tiene más de 1.8 millones de usuarios activos y rating 4.9/5 en App Store. Fácil de recomendar.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section class="how-section" id="como-funciona">
+  <div class="how-inner">
+    <div class="section-header">
+      <div class="section-eyebrow" style="background:rgba(74,201,227,.15);color:var(--cy)">Proceso</div>
+      <h2 class="section-title" style="color:#fff">Así de fácil</h2>
+      <p class="section-sub" style="color:rgba(255,255,255,.55)">De registro a primera comisión en menos de 24 horas.</p>
+    </div>
+    <div class="how-steps">
+      <div class="how-step"><div class="how-step-num">1</div><h3>Regístrate</h3><p>Llena el formulario con tus datos, sube tus documentos y firma el contrato digital.</p></div>
+      <div class="how-step"><div class="how-step-num">2</div><h3>Recibe tu QR</h3><p>En 24 hrs recibirás tu QR único por WhatsApp para comenzar a referir.</p></div>
+      <div class="how-step"><div class="how-step-num">3</div><h3>Refiere personas</h3><p>Comparte tu QR. Tus referidos descargan Aplazo y crean su cuenta con tu código.</p></div>
+      <div class="how-step"><div class="how-step-num">4</div><h3>Cobra tus $250</h3><p>Cada usuario activado genera $250 MXN que depositamos directo a tu CLABE.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- WAVE 2 -->
+<div style="background:var(--tl)">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 56" fill="#F2F4F6" style="display:block">
+    <path d="M0,18L60,21.3C120,24,240,32,360,34.7C480,37,600,35,720,29.3C840,24,960,16,1080,13.3C1200,11,1320,13,1380,14.7L1440,16L1440,56L1380,56C1320,56,1200,56,1080,56C960,56,840,56,720,56C600,56,480,56,360,56C240,56,120,56,60,56L0,56Z"/>
+  </svg>
+</div>
+
+<!-- EARNINGS SECTION -->
+<section class="earn-section" id="ganancias">
+  <div class="earn-inner">
+    <div class="section-header">
+      <div class="section-eyebrow">Tus ganancias</div>
+      <h2 class="section-title">Cuánto puedes ganar</h2>
+      <p class="section-sub">Calculado con comisiones reales del programa.</p>
+    </div>
+    <div class="earn-grid">
+      <div class="earn-card featured">
+        <div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.5);margin-bottom:16px">Por referido activado</div>
+        <div><span class="earn-unit" style="color:var(--cy)">$</span><span class="earn-big" style="color:var(--cy)">250</span></div>
+        <div class="earn-freq" style="color:rgba(255,255,255,.5)">MXN depositados a tu CLABE</div>
+        <div class="earn-detail"><i class="bi bi-check-circle-fill"></i> Sin límite de referidos por mes</div>
+        <div class="earn-detail"><i class="bi bi-check-circle-fill"></i> Pago al siguiente día hábil</div>
+        <div class="earn-detail"><i class="bi bi-check-circle-fill"></i> Vigencia 2 meses renovable</div>
+      </div>
+      <div class="earn-card" style="display:flex;flex-direction:column;gap:14px">
+        <div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--t3);margin-bottom:4px">Ejemplos de ganancias</div>
+        ${[['5 referidos/semana','$5,000 MXN/mes'],['10 referidos/semana','$10,000 MXN/mes'],['20 referidos/semana','$20,000 MXN/mes']].map(([a,b])=>`
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:var(--bg);border-radius:12px;border:1px solid var(--bd)">
+          <span style="font-size:13px;color:var(--t2);font-weight:600">${a}</span>
+          <span style="font-size:16px;font-weight:800;color:var(--tl)">${b}</span>
+        </div>`).join('')}
+        <div style="background:var(--fm);border-radius:12px;padding:12px 14px;font-size:12px;color:var(--se);line-height:1.5;border:1px solid rgba(74,201,227,.2)">
+          <i class="bi bi-info-circle-fill" style="margin-right:6px"></i>
+          Estimado basado en $250 MXN por usuario activado. Se requiere factura para el pago.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════
+     REGISTRATION FORM — id="registro"
+════════════════════════════════════════════ -->
+<div id="registro">
+  <!-- Stepper bar -->
+  <div class="stepper-wrap">
+    <div class="stepper-inner" id="stepper"></div>
+  </div>
+  <!-- Form content -->
+  <div class="form-wrap" id="app"></div>
+</div>
+
+<!-- FOOTER -->
+<footer class="footer">
+  <div class="footer-logo">
+    <div class="logo-pill" style="transform:scale(.85);transform-origin:center">
+      <span class="logo-text">aplazo</span>
+      <div class="logo-icon"></div>
+    </div>
+  </div>
+  <p>
+    APLAZ S.A. de C.V. · Av. Paseo de las Palmas 830, Int. 402, Lomas de Chapultepec, CDMX 11000<br>
+    <a href="mailto:embajadores@aplazo.mx">embajadores@aplazo.mx</a> · <a href="mailto:legal@aplazo.mx">legal@aplazo.mx</a><br>
+    © 2024 Aplazo. Todos los derechos reservados.
+  </p>
+</footer>
+
+<script>
+var CONTRACT_B64 = '${contractB64Embedded}';
+
+const S = {
+  step: 1,
+  D: {},
+  errs: {},
+  ineOk: false, bankOk: false, domOk: false,
+  ineL:  false, bankL:  false, domL:  false,
+  acc: false, sigTs: null,
+  rid: '', summ: [],
+  gen: false, ip: '—',
+};
+
+const STEPS = ['','Tus datos','Documentos','Verificar','Contrato','¡Listo!'];
+
+function render() {
+  renderStepper();
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  const el = buildStep(S.step);
+  app.appendChild(el);
+  el.style.animation = 'fadeUp .35s ease both';
+}
+
+function renderStepper() {
+  const el = document.getElementById('stepper');
+  el.innerHTML = '';
+  [1,2,3,4,5].forEach(function(i) {
+    const dot = document.createElement('div');
+    dot.className = 's-dot';
+    if (i < S.step) {
+      dot.style.cssText = 'background:#4AC9E3;color:#214345;box-shadow:0 0 0 3px rgba(74,201,227,.2)';
+      dot.innerHTML = '<i class="bi bi-check" style="font-size:12px;font-weight:900"></i>';
+    } else if (i === S.step) {
+      dot.style.cssText = 'background:#214345;color:#fff;box-shadow:0 0 0 4px rgba(74,201,227,.2)';
+      dot.textContent = i;
+    } else {
+      dot.style.cssText = 'background:#EBEDF0;color:#8FA0AC;border:1.5px solid #E2E5E8';
+      dot.textContent = i;
+    }
+    const lbl = document.createElement('span');
+    lbl.className = 's-label';
+    lbl.style.color = i < S.step ? '#357A09' : i === S.step ? '#214345' : '#7F8D98';
+    lbl.textContent = STEPS[i];
+    el.appendChild(dot);
+    el.appendChild(lbl);
+    if (i < 5) {
+      const line = document.createElement('div');
+      line.className = 's-line';
+      line.style.background = i < S.step ? '#4AC9E3' : '#E2E5E8';
+      el.appendChild(line);
+    }
+  });
+}
+
+function go(n) {
+  S.step = n;
+  document.getElementById('registro').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  render();
+}
+
+function buildStep(n) {
+  var fns = {1:buildStep1, 2:buildStep2, 3:buildStep3, 4:buildStep4, 5:buildStep5};
+  return fns[n]();
+}
+
+function h(tag, attrs, children) {
+  attrs = attrs || {}; children = children || [];
+  const el = document.createElement(tag);
+  Object.keys(attrs).forEach(function(k) {
+    var v = attrs[k];
+    if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k === 'class') el.className = v;
+    else if (k === 'onClick') el.addEventListener('click', v);
+    else el.setAttribute(k, v);
+  });
+  children.forEach(function(c) {
+    if (typeof c === 'string') el.appendChild(document.createTextNode(c));
+    else if (c) el.appendChild(c);
+  });
+  return el;
+}
+
+function fld(label, hint, child, span) {
+  const d = h('div', {class: 'fld' + (span ? ' span2' : '')});
+  d.appendChild(h('label', {}, [label]));
+  d.appendChild(child);
+  if (hint) d.appendChild(h('span', {class: 'hint'}, [hint]));
+  return d;
+}
+
+function inp(id, placeholder, type, opts) {
+  type = type || 'text'; opts = opts || {};
+  const el = document.createElement('input');
+  el.id = id; el.placeholder = placeholder; el.type = type;
+  if (opts.maxLength) el.maxLength = opts.maxLength;
+  el.value = S.D[id] || '';
+  if (S.errs[id]) el.classList.add('err');
+  el.addEventListener('input', function(e) { S.D[id] = e.target.value; S.errs[id] = false; e.target.classList.remove('err'); });
+  return el;
+}
+
+// ── STEP 1 ──
+function buildStep1() {
+  const wrap = h('div', {});
+  const card = h('div', {class: 'fcard'});
+  const hdr = h('div', {class: 'fcard-header'});
+  hdr.innerHTML = '<div class="fcard-eyebrow"><i class="bi bi-person-fill"></i> Paso 1 de 4</div><div class="fcard-title">Información personal</div><div class="fcard-sub">Ingresa tus datos básicos para comenzar el registro como embajador.</div>';
+  card.appendChild(hdr);
+  const g = h('div', {class: 'g2'});
+  g.appendChild(fld('Nombre(s) *', '', inp('nom', 'María Elena')));
+  g.appendChild(fld('Apellidos *', '', inp('ap', 'González Ramírez')));
+  g.appendChild(fld('Teléfono *', 'WhatsApp preferido', inp('tel', '55 1234 5678', 'tel')));
+  g.appendChild(fld('Correo electrónico *', '', inp('email', 'tu@correo.com', 'email')));
+  g.appendChild(fld('Ciudad / Sucursal *', '', inp('ciudad', 'CDMX, Guadalajara...')));
+  const sel = document.createElement('select');
+  Object.assign(sel.style, {height:'46px',borderRadius:'12px',border:'1.5px solid var(--bd)',
+    background:'var(--card)',padding:'0 14px',fontFamily:"'Plus Jakarta Sans',sans-serif",
+    fontSize:'14px',color:'var(--t1)',width:'100%'});
+  ['','KAM / Ejecutivo Aplazo','Redes sociales','Un amigo / embajador','Los Premios Aplazo','Otro'].forEach(function(o) {
+    const opt = document.createElement('option'); opt.value = o;
+    opt.textContent = o || '¿Cómo conociste el programa?'; sel.appendChild(opt);
+  });
+  sel.value = S.D.fuente || '';
+  sel.addEventListener('change', function(e) { S.D.fuente = e.target.value; });
+  g.appendChild(fld('¿Cómo conociste el programa?', '', sel));
+  card.appendChild(g);
+  wrap.appendChild(card);
+
+  // Trust bar
+  const trust = h('div', {style:{display:'flex',gap:'16px',flexWrap:'wrap',padding:'4px 0 8px',justifyContent:'center'}});
+  [['bi-shield-check','Datos protegidos'],['bi-file-earmark-lock','Contrato legal'],['bi-bank','Pago seguro']].forEach(function(item){
+    const t = h('div',{style:{display:'flex',alignItems:'center',gap:'6px',fontSize:'12px',color:'var(--t3)',fontWeight:'600'}});
+    t.innerHTML = '<i class="bi '+item[0]+'" style="color:var(--cy)"></i> '+item[1];
+    trust.appendChild(t);
+  });
+  wrap.appendChild(trust);
+
+  const nav = h('div', {class: 'form-nav'});
+  nav.appendChild(h('span', {}));
+  const btn = h('button', {class: 'btn btn-primary', onClick: s1next});
+  btn.innerHTML = 'Continuar <i class="bi bi-arrow-right"></i>';
+  nav.appendChild(btn);
+  wrap.appendChild(nav);
+  return wrap;
+}
+
+function s1next() {
+  ['nom','ap','tel','email','ciudad'].forEach(function(id) {
+    var el = document.getElementById(id); if (el) S.D[id] = el.value;
+  });
+  var sel = document.querySelector('select'); if (sel) S.D.fuente = sel.value;
+  const e = {};
+  if (!S.D.nom||!S.D.nom.trim()) e.nom = 1;
+  if (!S.D.ap||!S.D.ap.trim()) e.ap = 1;
+  if (!S.D.tel||S.D.tel.length < 8) e.tel = 1;
+  var em = S.D.email || '';
+  if (em.indexOf('@') < 1 || em.indexOf('.') < 0 || em.length < 5) e.email = 1;
+  if (!S.D.ciudad||!S.D.ciudad.trim()) e.ciudad = 1;
+  S.errs = e;
+  if (!Object.keys(e).length) go(2); else render();
+}
+
+// ── STEP 2 ──
+function buildStep2() {
+  const wrap = h('div', {});
+
+  // Upload card
+  const ucard = h('div', {class: 'fcard'});
+  const uhdr = h('div', {class: 'fcard-header'});
+  uhdr.innerHTML = '<div class="fcard-eyebrow"><i class="bi bi-files"></i> Documentos</div><div class="fcard-title">Sube tus documentos</div><div class="fcard-sub">Necesitamos verificar tu identidad y datos bancarios. JPG, PNG o PDF.</div>';
+  ucard.appendChild(uhdr);
+  const dgrid = h('div', {class: 'doc-grid'});
+  dgrid.appendChild(buildUpzone('ine'));
+  dgrid.appendChild(buildUpzone('bank'));
+  dgrid.appendChild(buildUpzone('dom_doc'));
+  ucard.appendChild(dgrid);
+  wrap.appendChild(ucard);
+
+  // Data card
+  const dcard = h('div', {class: 'fcard'});
+  const dhdr = h('div', {class: 'fcard-header'});
+  dhdr.innerHTML = '<div class="fcard-eyebrow"><i class="bi bi-card-text"></i> Datos del contrato</div><div class="fcard-title">Información bancaria y fiscal</div><div class="fcard-sub">Estos datos aparecerán en tu contrato. Todos los campos son obligatorios.</div>';
+  dcard.appendChild(dhdr);
+  const g = h('div', {class: 'g2'});
+  g.appendChild(fld('Nombre completo según INE *', '', inp('nin', 'Como aparece en tu INE')));
+  g.appendChild(fld('RFC *', '', inp('rfc', 'GORA880512HDF', 'text', {maxLength:13})));
+  g.appendChild(fld('Banco *', '', inp('banco', 'BBVA, Banamex, HSBC...')));
+  g.appendChild(fld('Número de cuenta *', '', inp('cuenta', '10 u 11 dígitos')));
+  g.appendChild(fld('CLABE interbancaria *', '18 dígitos — para recibir tus comisiones', inp('clabe', '18 dígitos', 'text', {maxLength:18}), true));
+  g.appendChild(fld('Titular de la cuenta *', '', inp('titular', 'Nombre del titular')));
+  g.appendChild(fld('Domicilio *', 'Calle, número, colonia, ciudad, C.P.', inp('dom', 'Ej: Insurgentes Sur 1234, Col. Del Valle, CDMX, 03100'), true));
+  dcard.appendChild(g);
+  wrap.appendChild(dcard);
+
+  const nav = h('div', {class: 'form-nav'});
+  const bk = h('button', {class: 'btn btn-outline', onClick: function(){ go(1); }});
+  bk.innerHTML = '<i class="bi bi-arrow-left"></i> Atrás';
+  nav.appendChild(bk);
+  const nx = h('button', {class: 'btn btn-primary', onClick: s2next});
+  nx.innerHTML = 'Revisar datos <i class="bi bi-arrow-right"></i>';
+  nav.appendChild(nx);
+  wrap.appendChild(nav);
+  return wrap;
+}
+
+function buildUpzone(type) {
+  const cfgs = {
+    ine:     {done:S.ineOk,  load:S.ineL,  icon:'bi-person-vcard-fill', label:'INE / IFE',           doneLabel:'INE ✓', sub:'JPG, PNG o PDF'},
+    bank:    {done:S.bankOk, load:S.bankL, icon:'bi-bank',              label:'Estado de cuenta',    doneLabel:'Estado de cuenta ✓', sub:'PDF o imagen'},
+    dom_doc: {done:S.domOk,  load:S.domL,  icon:'bi-house-door-fill',   label:'Comp. domicilio',     doneLabel:'Domicilio ✓', sub:'PDF o imagen'},
+  };
+  const cfg = cfgs[type];
+  const el = h('div', {class: 'upzone' + (cfg.done ? ' done' : cfg.load ? ' loading' : '')});
+  el.addEventListener('click', function() {
+    if (cfg.load) return;
+    const fi = document.createElement('input'); fi.type = 'file'; fi.accept = 'image/*,.pdf';
+    fi.onchange = function(e) { if (e.target.files[0]) loadFile(type, e.target.files[0]); };
+    fi.click();
+  });
+  const iconEl = h('div', {class: 'upzone-icon', style: {
+    background: cfg.done ? 'var(--gl)' : cfg.load ? 'var(--fm)' : 'var(--n100)',
+    color: cfg.done ? 'var(--gd)' : cfg.load ? 'var(--aq)' : 'var(--n400)'
+  }});
+  if (cfg.load) iconEl.innerHTML = '<div class="spin" style="width:22px;height:22px;border:2.5px solid #EBEDF0;border-top-color:#4AC9E3"></div>';
+  else if (cfg.done) iconEl.innerHTML = '<i class="bi bi-check-circle-fill" style="font-size:24px"></i>';
+  else iconEl.innerHTML = '<i class="bi ' + cfg.icon + '" style="font-size:24px"></i>';
+  const lbl = h('div', {class: 'upzone-label', style: {color: cfg.done ? 'var(--gd)' : 'var(--t2)'}});
+  lbl.textContent = cfg.load ? 'Subiendo...' : (cfg.done ? cfg.doneLabel : cfg.label);
+  const sub = h('div', {class: 'upzone-sub'});
+  sub.textContent = cfg.sub;
+  el.appendChild(iconEl); el.appendChild(lbl); el.appendChild(sub);
+  return el;
+}
+
+function loadFile(type, file) {
+  if (type === 'ine') S.ineL = true;
+  else if (type === 'bank') S.bankL = true;
+  else if (type === 'dom_doc') S.domL = true;
+  render();
+  const r = new FileReader();
+  r.onload = function(e) {
+    const b64 = e.target.result.split(',')[1];
+    const mime = file.type.startsWith('image/') ? file.type : 'application/pdf';
+    if (type === 'ine')      { S.D.ineB64 = b64; S.D.ineMime = mime; S.ineL = false; S.ineOk = true; }
+    else if (type === 'bank')    { S.D.bankB64 = b64; S.D.bankMime = mime; S.bankL = false; S.bankOk = true; }
+    else if (type === 'dom_doc') { S.D.domB64 = b64; S.D.domMime = mime; S.domL = false; S.domOk = true; }
+    render();
+  };
+  r.readAsDataURL(file);
+}
+
+function s2next() {
+  var req = ['nin','rfc','banco','cuenta','clabe','titular','dom'];
+  var missing = req.filter(function(k) { return !S.D[k] || !S.D[k].trim(); });
+  if (missing.length) { alert('Por favor completa todos los campos requeridos.'); return; }
+  if ((S.D.clabe||'').length !== 18) { alert('La CLABE debe tener exactamente 18 dígitos.'); return; }
+  if (!S.ineOk)  { alert('Por favor sube tu INE / IFE.'); return; }
+  if (!S.bankOk) { alert('Por favor sube tu estado de cuenta.'); return; }
+  if (!S.domOk)  { alert('Por favor sube tu comprobante de domicilio.'); return; }
+  go(3);
+}
+
+// ── STEP 3 ──
+function buildStep3() {
+  const wrap = h('div', {});
+  const card = h('div', {class: 'fcard'});
+  const hdr = h('div', {class: 'fcard-header'});
+  hdr.innerHTML = '<div class="fcard-eyebrow"><i class="bi bi-check2-all"></i> Revisión</div><div class="fcard-title">Verifica tu información</div><div class="fcard-sub">Confirma que todos tus datos sean correctos antes de firmar el contrato.</div>';
+  card.appendChild(hdr);
+
+  const grid = h('div', {class: 'review-grid'});
+  [['Nombre (INE)', S.D.nin],['RFC', S.D.rfc],['Embajador', S.D.nom + ' ' + S.D.ap],
+   ['Correo', S.D.email],['Teléfono', S.D.tel],['Ciudad', S.D.ciudad],
+   ['Banco', S.D.banco],['Cuenta', S.D.cuenta],['CLABE', S.D.clabe],
+   ['Titular', S.D.titular],['Domicilio', S.D.dom]
+  ].forEach(function(pair) {
+    const c = h('div', {class: 'review-cell'});
+    c.appendChild(h('div', {class: 'review-key'}, [pair[0]]));
+    c.appendChild(h('div', {class: 'review-val'}, [pair[1] || '—']));
+    grid.appendChild(c);
+  });
+  card.appendChild(grid);
+
+  // Doc status chips
+  const docRow = h('div', {class: 'doc-status-row', style: {marginTop:'14px'}});
+  [['INE / IFE', S.ineOk], ['Estado de cuenta', S.bankOk], ['Comp. domicilio', S.domOk]].forEach(function(d) {
+    const chip = h('div', {class: 'doc-status-chip'});
+    chip.innerHTML = '<i class="bi bi-file-earmark-check-fill"></i> ' + d[0];
+    docRow.appendChild(chip);
+  });
+  card.appendChild(docRow);
+  wrap.appendChild(card);
+
+  const nav = h('div', {class: 'form-nav'});
+  const bk = h('button', {class: 'btn btn-outline', onClick: function(){ go(2); }});
+  bk.innerHTML = '<i class="bi bi-arrow-left"></i> Corregir';
+  nav.appendChild(bk);
+  const nx = h('button', {class: 'btn btn-primary', onClick: function() {
+    fetch('https://api.ipify.org?format=json').then(function(r){ return r.json(); }).then(function(d){ S.ip = d.ip; }).catch(function(){});
+    go(4);
+  }});
+  nx.innerHTML = 'Ver contrato <i class="bi bi-file-earmark-text"></i>';
+  nav.appendChild(nx);
+  wrap.appendChild(nav);
+  return wrap;
+}
+
+// ── STEP 4 ──
+function buildStep4() {
+  const today = new Date().toLocaleDateString('es-MX', {day:'2-digit', month:'long', year:'numeric'});
+  const signer = S.D.nin || (S.D.nom + ' ' + S.D.ap);
+  const wrap = h('div', {});
+  const card = h('div', {class: 'fcard'});
+  const hdr = h('div', {class: 'fcard-header'});
+  hdr.innerHTML = '<div class="fcard-eyebrow"><i class="bi bi-file-earmark-text-fill"></i> Contrato</div><div class="fcard-title">Contrato de Comisión Mercantil</div><div class="fcard-sub">Lee y acepta los términos para finalizar tu registro como embajador Aplazo.</div>';
+  card.appendChild(hdr);
+
+  const box = h('div', {class: 'contract-scroll'});
+  box.innerHTML =
+    '<div style="text-align:center;font-weight:800;font-size:13px;margin-bottom:16px;color:var(--tl)">CONTRATO DE COMISIÓN MERCANTIL<br><span style="font-size:11px;font-weight:500;color:var(--t3)">APLAZ S.A. de C.V. — El COMISIONISTA</span></div>' +
+    '<div class="contract-filled-row">' +
+    '<div><span style="color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Nombre:</span><br><span class="hl">' + S.D.nin + '</span></div>' +
+    '<div><span style="color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">RFC:</span><br><span class="hl">' + S.D.rfc + '</span></div>' +
+    '<div style="grid-column:1/-1"><span style="color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Domicilio:</span><br><span class="hl">' + S.D.dom + '</span></div>' +
+    '<div><span style="color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Banco:</span><br><span class="hl">' + S.D.banco + '</span></div>' +
+    '<div><span style="color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Cuenta:</span><br><span class="hl">' + S.D.cuenta + '</span></div>' +
+    '<div style="grid-column:1/-1"><span style="color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">CLABE:</span><br><span class="hl">' + S.D.clabe + '</span></div>' +
+    '<div style="grid-column:1/-1"><span style="color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Fecha:</span><br><span class="hl">' + today + '</span></div>' +
+    '</div>' +
+    '<div style="background:var(--n100);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:12px;display:flex;gap:20px;flex-wrap:wrap">' +
+    '<span><strong>Vigencia:</strong> 2 meses</span><span><strong>Referral Fee:</strong> $250 MXN / usuario activado</span>' +
+    '</div>' +
+    '<p style="margin-bottom:10px"><strong style="font-size:12px;color:var(--tl)">OBJETO.</strong> Mandato no exclusivo para que <strong>' + signer + '</strong> promueva y refiera personas físicas a APLAZO como USUARIOS.</p>' +
+    '<p style="margin-bottom:10px"><strong style="font-size:12px;color:var(--tl)">PAGOS.</strong> $250 MXN al siguiente día hábil de la activación, depositados en CLABE <strong>' + S.D.clabe + '</strong> (' + S.D.banco + '). El COMISIONISTA deberá emitir factura.</p>' +
+    '<p style="margin-bottom:10px"><strong style="font-size:12px;color:var(--tl)">VIGENCIA.</strong> 2 meses desde la firma. El COMITENTE puede terminar en cualquier momento mediante aviso escrito.</p>' +
+    '<p style="font-size:10px;color:var(--t3);margin-top:12px">COMITENTE: Alexander Wieland Castillo · APLAZ S.A. de C.V. · Av. Paseo de las Palmas 830, Int.402, CDMX · legal@aplazo.mx</p>';
+  card.appendChild(box);
+
+  // Accept row
+  const acceptRow = h('div', {class: 'accept-row' + (S.acc ? ' checked' : '')});
+  acceptRow.addEventListener('click', function() {
+    S.acc = !S.acc;
+    if (S.acc) S.sigTs = new Date();
+    render();
+  });
+  const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = S.acc;
+  cb.style.cssText = 'width:20px;height:20px;accent-color:var(--cy);flex-shrink:0;margin-top:1px;cursor:pointer';
+  const lblTxt = h('label', {style: {fontSize:'13px', color:'var(--t2)', lineHeight:'1.55', cursor:'pointer'}});
+  lblTxt.innerHTML = 'He leído y acepto el <strong>Contrato de Comisión Mercantil</strong> con APLAZ, S.A. de C.V. · Recibiré <strong>$250 MXN</strong> por usuario activado · Vigencia <strong>2 meses</strong>.';
+  acceptRow.appendChild(cb); acceptRow.appendChild(lblTxt);
+  card.appendChild(acceptRow);
+
+  if (S.acc) {
+    const sig = h('div', {class: 'sig-block'});
+    sig.appendChild(h('div', {class: 'sig-name'}, [signer]));
+    const meta = h('div', {class: 'sig-meta'});
+    meta.textContent = 'Firmado digitalmente el ' + (S.sigTs ? S.sigTs.toLocaleString('es-MX') : '') + ' · IP: ' + S.ip;
+    sig.appendChild(meta);
+    card.appendChild(sig);
+  }
+  wrap.appendChild(card);
+
+  const nav = h('div', {class: 'form-nav'});
+  const bk = h('button', {class: 'btn btn-outline', onClick: function(){ go(3); }});
+  bk.innerHTML = '<i class="bi bi-arrow-left"></i> Atrás';
+  nav.appendChild(bk);
+  const nx = h('button', {class: 'btn btn-primary', onClick: doSign});
+  nx.disabled = !S.acc || S.gen;
+  nx.innerHTML = '<i class="bi bi-pen-fill"></i> Firmar y registrarme';
+  nav.appendChild(nx);
+  wrap.appendChild(nav);
+  return wrap;
+}
+
+function doSign() {
+  showOverlay('Firmando tu contrato...', 'Generando documento oficial personalizado');
+  S.gen = true;
+  if (!CONTRACT_B64 || CONTRACT_B64.length < 100) { doSubmitToServer(S.D); return; }
+  if (!window.PDFLib) {
+    showOverlay('Cargando librerías...', 'Un momento por favor');
+    var waited = 0;
+    var interval = setInterval(function() {
+      waited += 200;
+      if (window.PDFLib) { clearInterval(interval); runPdfFill(CONTRACT_B64); }
+      else if (waited >= 8000) { clearInterval(interval); doSubmitToServer(S.D); }
+    }, 200);
+    return;
+  }
+  runPdfFill(CONTRACT_B64);
+}
+
+function b64Encode(bytes) {
+  var CHUNK = 3 * 1024;
+  var result = '';
+  for (var i = 0; i < bytes.length; i += CHUNK) {
+    var slice = bytes.subarray(i, i + CHUNK);
+    result += btoa(String.fromCharCode.apply(null, slice));
+  }
+  return result;
+}
+
+function runPdfFill(blankB64) {
+  var today = new Date().toLocaleDateString('es-MX', {day:'2-digit', month:'long', year:'numeric'});
+  var signer = S.D.nin || (S.D.nom + ' ' + S.D.ap);
+  var raw = Uint8Array.from(atob(blankB64), function(c){ return c.charCodeAt(0); });
+  PDFLib.PDFDocument.load(raw, {ignoreEncryption:true}).then(function(doc) {
+    return Promise.all([
+      doc.embedFont(PDFLib.StandardFonts.TimesRoman),
+      doc.embedFont(PDFLib.StandardFonts.TimesRomanBold)
+    ]).then(function(fonts) {
+      var font = fonts[0]; var fontBold = fonts[1];
+      var pages = doc.getPages();
+      var p1 = pages[0]; var p8 = pages[7];
+      var black = PDFLib.rgb(0,0,0); var white = PDFLib.rgb(1,1,1);
+      var h1 = p1.getHeight(); var fs = 9;
+      function t(pg, x, y, val) { if (val) pg.drawText(String(val), {x:x, y:pg.getHeight()-y, size:fs, font:font, color:black}); }
+      function tBold(pg, x, y, val, sz) { if (val) pg.drawText(String(val), {x:x, y:pg.getHeight()-y, size:sz||11, font:fontBold, color:black}); }
+      t(p1,110,218,signer); t(p1,98,231,S.D.rfc||''); t(p1,120,244,S.D.domicilio||S.D.dom||'');
+      t(p1,172,257,S.D.email||''); t(p1,176,270,S.D.clabe||''); t(p1,100,283,S.D.banco||'');
+      t(p1,106,296,S.D.cuenta||''); t(p1,150,309,today);
+      p1.drawRectangle({x:406, y:h1-502, width:125, height:16, color:white});
+      tBold(p1,360,534,signer,10); tBold(p8,360,634,signer,10);
+      return doc.save();
+    });
+  }).then(function(bytes) {
+    S.contractBytes = bytes;
+    S.contractB64filled = b64Encode(bytes);
+    var data = JSON.parse(JSON.stringify(S.D));
+    data.contractB64 = S.contractB64filled;
+    doSubmitToServer(data);
+  }).catch(function(err) {
+    console.error('PDF fill error:', err.message || err);
+    doSubmitToServer(S.D);
+  });
+}
+
+function doSubmitToServer(data) {
+  showOverlay('Enviando registro...', 'Guardando documentos y contrato en Drive');
+  google.script.run
+    .withSuccessHandler(function(result) {
+      var rid = result.regId || ('EMB-' + Date.now().toString(36).toUpperCase());
+      S.rid = rid;
+      S.summ = [['ID de embajador', rid], ['Nombre', S.D.nom + ' ' + S.D.ap],
+                ['RFC', S.D.rfc], ['CLABE', S.D.clabe],
+                ['Comisión por activación', '$250 MXN'], ['Vigencia del contrato', '2 meses']];
+      S.gen = false; hideOverlay(); go(5);
+    })
+    .withFailureHandler(function(err) {
+      S.gen = false; hideOverlay();
+      alert('Error al procesar: ' + err.message);
+    })
+    .submitRegistration(JSON.stringify(data));
+}
+
+// ── STEP 5 ──
+function buildStep5() {
+  const wrap = h('div', {});
+
+  // Success hero
+  const hero = h('div', {class: 'success-hero'});
+  const chk = h('div', {class: 'success-check'});
+  chk.innerHTML = '<i class="bi bi-check-lg"></i>';
+  hero.appendChild(chk);
+  const title = h('div', {style: {fontSize:'26px', fontWeight:'800', color:'#fff', marginBottom:'8px'}});
+  title.textContent = '¡Ya eres embajador Aplazo!';
+  hero.appendChild(title);
+  const sub = h('div', {style: {fontSize:'14px', color:'rgba(255,255,255,.6)', lineHeight:'1.6', maxWidth:'380px', margin:'0 auto'}});
+  sub.textContent = 'Tu registro fue procesado exitosamente. En las próximas 24 hrs recibirás tu QR personalizado por WhatsApp.';
+  hero.appendChild(sub);
+  const idEl = h('div', {class: 'success-id'});
+  idEl.textContent = S.rid;
+  hero.appendChild(idEl);
+  wrap.appendChild(hero);
+
+  // Download card
+  const dlCard = h('div', {class: 'dl-card fcard', style: {marginBottom:'16px'}});
+  dlCard.innerHTML = '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--gd);margin-bottom:8px"><i class="bi bi-file-earmark-pdf-fill"></i> Tu contrato firmado</div><div style="font-size:13px;color:var(--gd);margin-bottom:14px;line-height:1.5">Descarga y guarda tu copia del Contrato de Comisión Mercantil. También lo recibirás por correo.</div>';
+  const dlBtn = h('button', {class: 'btn btn-primary btn-full', style: {background:'var(--gd)',color:'#fff',boxShadow:'none'}});
+  dlBtn.innerHTML = '<i class="bi bi-download"></i> Descargar contrato PDF';
+  dlBtn.addEventListener('click', function() {
+    if (S.contractBytes) {
+      var blob = new Blob([S.contractBytes], {type:'application/pdf'});
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'Contrato_Aplazo_' + (S.D.nom||'') + '_' + (S.D.ap||'').replace(/\s/g,'_') + '.pdf';
+      document.body.appendChild(a); a.click();
+      setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 100);
+    } else {
+      alert('El contrato se envió por correo a ' + S.D.email + '.');
+    }
+  });
+  dlCard.appendChild(dlBtn);
+  wrap.appendChild(dlCard);
+
+  // Summary card
+  const summCard = h('div', {class: 'fcard'});
+  summCard.innerHTML = '<div class="fcard-eyebrow"><i class="bi bi-list-check"></i> Resumen</div><div class="fcard-title" style="margin-bottom:16px">Tu contrato en resumen</div>';
+  const summList = h('div', {class: 'summ-list'});
+  S.summ.forEach(function(pair) {
+    const row = h('div', {class: 'summ-row'});
+    row.appendChild(h('span', {style: {color:'var(--t3)', fontWeight:'600'}}, [pair[0]]));
+    row.appendChild(h('span', {style: {color:'var(--tl)', fontWeight:'700'}}, [pair[1]]));
+    summList.appendChild(row);
+  });
+  summCard.appendChild(summList);
+  wrap.appendChild(summCard);
+
+  // Next steps card
+  const nextCard = h('div', {class: 'fcard', style:{background:'var(--tl)',border:'none'}});
+  nextCard.innerHTML = '<div class="fcard-eyebrow" style="background:rgba(74,201,227,.15);color:var(--cy)"><i class="bi bi-arrow-right-circle-fill"></i> Próximos pasos</div><div class="fcard-title" style="color:#fff;margin-bottom:14px">¿Qué sigue?</div>';
+  const steps = h('div', {style: {display:'flex', flexDirection:'column', gap:'12px'}});
+  [
+    ['bi-whatsapp','Recibe tu QR en 24 hrs','Te enviaremos tu código QR único por WhatsApp al '+S.D.tel+'.'],
+    ['bi-share-fill','Comparte y gana','Muéstrale tu QR a conocidos para que descarguen Aplazo y activen su cuenta.'],
+    ['bi-cash-stack','Cobra tu comisión','Por cada usuario activado recibirás $250 MXN directamente en tu cuenta.']
+  ].forEach(function(s){
+    const row = h('div',{style:{display:'flex',gap:'14px',alignItems:'flex-start'}});
+    row.innerHTML = '<div style="width:38px;height:38px;background:rgba(74,201,227,.15);border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0"><i class="bi '+s[0]+'" style="color:var(--cy);font-size:17px"></i></div><div><div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:3px">'+s[1]+'</div><div style="font-size:12px;color:rgba(255,255,255,.5);line-height:1.45">'+s[2]+'</div></div>';
+    steps.appendChild(row);
+  });
+  nextCard.appendChild(steps);
+  wrap.appendChild(nextCard);
+
+  return wrap;
+}
+
+function showOverlay(msg, sub) {
+  document.getElementById('overlay').style.display = 'flex';
+  document.getElementById('overlay-msg').textContent = msg;
+  document.getElementById('overlay-sub').textContent = sub || '';
+}
+function hideOverlay() { document.getElementById('overlay').style.display = 'none'; }
+
+// Init
+render();
+</script>
+</body>
+</html>`;
+}
